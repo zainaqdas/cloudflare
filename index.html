@@ -985,12 +985,12 @@ function _load(url){
   (url.includes('.m3u8')||url.includes('m3u8'))?_loadHLS(url):_loadDirect(url);
 }
 function _loadHLS(url){
-  const initialProxy = getProxy(); // pick first proxy for manifest load
 
   if(!Hls.isSupported()){
     if(video.canPlayType('application/vnd.apple.mpegurl')){
-      // iOS native HLS — can only use one proxy URL (no xhrSetup)
-      video.src = initialProxy ? initialProxy + encodeURIComponent(url) : url;
+      // iOS native HLS — xhrSetup not available, proxy the src directly
+      const proxy = useProxy ? getProxy() : '';
+      video.src = proxy ? proxy + encodeURIComponent(url) : url;
       video.play().catch(()=>{});
       _onStart('HLS Native');
       return;
@@ -1005,20 +1005,20 @@ function _loadHLS(url){
     maxMaxBufferLength: 120,
 
     xhrSetup(xhr, segmentUrl) {
-      if (!useProxy) return; // proxy off — direct request
+      // xhrSetup fires for EVERY request HLS.js makes:
+      // the manifest, every segment, every key file — everything.
+      // We handle all proxying here in one place.
+      // segmentUrl is always the raw original URL from the manifest.
+      if (!useProxy) return;
 
-      // Pick a proxy for this specific segment request (round-robin)
       const chosenProxy = getProxy();
-
-      // Intercept the XHR to route through the chosen worker
       xhr.open('GET', chosenProxy + encodeURIComponent(segmentUrl), true);
 
-      // Track success/fail per worker
-      const originalOnLoad = xhr.onload;
       xhr.addEventListener('load', () => {
         if (xhr.status >= 200 && xhr.status < 400) {
           proxySuccess(chosenProxy);
         } else {
+          // e.g. 429 rate limit, 403 forbidden, 5xx server error
           proxyFail(chosenProxy);
         }
         updateProxyStats();
@@ -1030,12 +1030,9 @@ function _loadHLS(url){
     }
   });
 
-  // If proxy is on, also proxy the manifest URL itself
-  const manifestUrl = (useProxy && initialProxy)
-    ? initialProxy + encodeURIComponent(url)
-    : url;
-
-  hls.loadSource(manifestUrl);
+  // Always pass the RAW original URL to loadSource.
+  // xhrSetup above intercepts it and adds the proxy transparently.
+  hls.loadSource(url);
   hls.attachMedia(video);
 
   hls.on(Hls.Events.MANIFEST_PARSED,(e,d)=>{
