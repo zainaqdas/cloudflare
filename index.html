@@ -105,6 +105,16 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
 .proxy-status{font-size:11px;font-weight:700;letter-spacing:1px;padding:2px 8px;border-radius:4px;background:rgba(34,197,94,.12);color:#22c55e;border:1px solid rgba(34,197,94,.25);transition:all .2s;}
 .proxy-status.off{background:rgba(255,255,255,.05);color:var(--muted);border-color:var(--border);}
 .proxy-hint{font-size:11px;color:var(--muted);}
+.proxy-mode-wrap{display:flex;gap:4px;align-items:center;}
+.proxy-mode-btn{
+  background:var(--surface2);border:1px solid var(--border);
+  color:var(--muted);padding:3px 9px;border-radius:5px;
+  font-size:11px;font-weight:500;cursor:pointer;
+  font-family:'DM Sans',sans-serif;transition:all .15s;
+  white-space:nowrap;
+}
+.proxy-mode-btn.active{background:var(--accent);border-color:var(--accent);color:#fff;}
+.proxy-mode-wrap.disabled{opacity:.35;pointer-events:none;}
 
 /* ══════════════════════════════════════
    PLAYER
@@ -475,6 +485,10 @@ video::cue{background:rgba(0,0,0,.78);color:#fff;font-size:15px;}
       </span>
       <span class="proxy-status" id="proxyStatus">ON</span>
     </div>
+    <div class="proxy-mode-wrap" id="proxyModeWrap">
+      <button class="proxy-mode-btn" id="modeManifest" onclick="setProxyMode('manifest')" title="Only proxy the manifest (.m3u8). Segments load direct. Saves ~98% bandwidth on your workers.">Manifest Only</button>
+      <button class="proxy-mode-btn active" id="modeFull" onclick="setProxyMode('full')" title="Proxy everything through workers. Use if direct segments fail.">Full</button>
+    </div>
     <span class="proxy-hint" id="proxyHint">Bypasses CORS restrictions</span>
   </div>
 
@@ -753,7 +767,7 @@ video::cue{background:rgba(0,0,0,.78);color:#fff;font-size:15px;}
 let hls=null, retryCount=0, maxRetries=3, retryTimer=null;
 let isLoading=false, autoRetry=true, idleHide=false, idleTimer=null;
 let currentUrl='', currentName='', isLoop=false, isMini=false;
-let useProxy=true, statsIv=null;
+let useProxy=true, proxyMode='full', statsIv=null; // proxyMode: 'full' | 'manifest'
 let seekAmt=10;         // double-tap seek seconds
 let wakeLock=null;      // Screen Wake Lock API
 let brightness=1;       // CSS filter brightness
@@ -768,9 +782,9 @@ let touchHideTimer=null;
 // ══════════════════════════════════════
 const PROXY_POOL = [
   'https://hlsplayer.dgfrii1800.workers.dev/?url=',
-  'https://hlsplayer2.dgfrii1800.workers.dev/?url=',
-  'https://hlsplayer3.dgfrii1800.workers.dev/?url=',
-  'https://hlsplayer4.dgfrii1800.workers.dev/?url=',
+  // 'https://yourworker2.dgfrii1800.workers.dev/?url=',
+  // 'https://yourworker3.dgfrii1800.workers.dev/?url=',
+  // 'https://yourworker4.dgfrii1800.workers.dev/?url=',
 ];
 
 // Per-worker health tracking
@@ -984,11 +998,26 @@ function _load(url){
   stopStats();
   (url.includes('.m3u8')||url.includes('m3u8'))?_loadHLS(url):_loadDirect(url);
 }
+// Returns true if the URL is an HLS manifest (.m3u8)
+// Returns false if it is a segment (.ts, .m4s, .aac, .mp4, .fmp4, etc.)
+function isManifestUrl(url) {
+  try {
+    // Strip query string for extension check
+    const path = new URL(url).pathname.toLowerCase();
+    return path.endsWith('.m3u8') || path.includes('.m3u8?') || path.includes('m3u8');
+  } catch {
+    return url.toLowerCase().includes('m3u8');
+  }
+}
+
 function _loadHLS(url){
 
   if(!Hls.isSupported()){
     if(video.canPlayType('application/vnd.apple.mpegurl')){
-      // iOS native HLS — xhrSetup not available, proxy the src directly
+      // iOS native HLS — xhrSetup not available
+      // In manifest-only mode we still have to proxy the manifest src
+      // (segments on iOS are fetched natively by WebKit, not through JS,
+      //  so there is nothing we can do about them anyway — they go direct)
       const proxy = useProxy ? getProxy() : '';
       video.src = proxy ? proxy + encodeURIComponent(url) : url;
       video.play().catch(()=>{});
@@ -1005,12 +1034,21 @@ function _loadHLS(url){
     maxMaxBufferLength: 120,
 
     xhrSetup(xhr, segmentUrl) {
-      // xhrSetup fires for EVERY request HLS.js makes:
-      // the manifest, every segment, every key file — everything.
-      // We handle all proxying here in one place.
-      // segmentUrl is always the raw original URL from the manifest.
-      if (!useProxy) return;
+      if (!useProxy) return; // proxy completely off — everything direct
 
+      const manifest = isManifestUrl(segmentUrl);
+
+      if (proxyMode === 'manifest' && !manifest) {
+        // ── MANIFEST-ONLY MODE ──────────────────────────────────────
+        // This is a segment/key request. Let it go direct.
+        // We do NOT call xhr.open() here — HLS.js already opened it
+        // with the original URL, so it will just fetch directly.
+        // No proxy bandwidth used for segments at all.
+        return;
+      }
+
+      // ── FULL MODE  (or manifest request in manifest-only mode) ───
+      // Route through the proxy pool (round-robin + failover).
       const chosenProxy = getProxy();
       xhr.open('GET', chosenProxy + encodeURIComponent(segmentUrl), true);
 
@@ -1018,7 +1056,6 @@ function _loadHLS(url){
         if (xhr.status >= 200 && xhr.status < 400) {
           proxySuccess(chosenProxy);
         } else {
-          // e.g. 429 rate limit, 403 forbidden, 5xx server error
           proxyFail(chosenProxy);
         }
         updateProxyStats();
@@ -1030,8 +1067,7 @@ function _loadHLS(url){
     }
   });
 
-  // Always pass the RAW original URL to loadSource.
-  // xhrSetup above intercepts it and adds the proxy transparently.
+  // Always pass the RAW original URL — xhrSetup handles all proxying.
   hls.loadSource(url);
   hls.attachMedia(video);
 
@@ -1059,7 +1095,15 @@ function _loadHLS(url){
     document.getElementById('sLvl').textContent=`${d.level+1}/${hls.levels.length}`;
   });
 
-  hls.on(Hls.Events.ERROR,(e,d)=>{if(d.fatal)_handleErr();});
+  hls.on(Hls.Events.ERROR,(e,d)=>{
+    if(!d.fatal) return;
+    // If manifest-only mode fails, it's likely because segments are
+    // also CORS-blocked. Automatically suggest switching to Full mode.
+    if(proxyMode === 'manifest'){
+      toast('Segments blocked — try switching proxy to Full mode','error',4000);
+    }
+    _handleErr();
+  });
 }
 function _loadDirect(url){
   video.src=url;
@@ -1132,17 +1176,32 @@ function toggleRetry(){autoRetry=!autoRetry;document.getElementById('retryTog').
 function toggleIdle(){idleHide=!idleHide;document.getElementById('idleTog').classList.toggle('on',idleHide);if(!idleHide){pw.classList.remove('idle');clearTimeout(idleTimer);}toast(idleHide?'Auto-hide on':'Auto-hide off');}
 function setSeekAmt(s,btn){seekAmt=s;document.querySelectorAll('#tab-settings .spd-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');toast(`Seek: ${s}s`);}
 
+function setProxyMode(mode){
+  proxyMode = mode;
+  document.getElementById('modeManifest').classList.toggle('active', mode === 'manifest');
+  document.getElementById('modeFull').classList.toggle('active', mode === 'full');
+  localStorage.setItem('sx_pm', mode);
+  const saving = mode === 'manifest'
+    ? 'Manifest Only — segments go direct. Saves ~98% worker bandwidth.'
+    : 'Full — everything through proxy. Use if segments fail directly.';
+  toast(saving, 'info', 3500);
+}
+
 function toggleProxy(){
   useProxy=!useProxy;
   document.getElementById('proxyTog').classList.toggle('on',useProxy);
   const st=document.getElementById('proxyStatus');
   st.textContent=useProxy?'ON':'OFF';
   st.classList.toggle('off',!useProxy);
+  // Grey out mode buttons when proxy is off
+  document.getElementById('proxyModeWrap').classList.toggle('disabled', !useProxy);
   // Reset health state when toggling so we start fresh
   proxyHealth.forEach(w=>{ w.errors=0; w.disabled=false; });
   proxyRoundRobinIndex=0;
   updateProxyStats();
-  toast(useProxy?`Proxy ON — ${proxyHealth.length} worker${proxyHealth.length>1?'s':''} active`:'Proxy disabled');
+  toast(useProxy
+    ? `Proxy ON — ${proxyHealth.length} worker${proxyHealth.length>1?'s':''} · ${proxyMode} mode`
+    : 'Proxy disabled — direct connection');
 }
 
 function isIOS(){
@@ -1521,12 +1580,18 @@ function applySettings(){
 
 (function init(){
   const v=loadVol();video.volume=v;volSl.value=v;
-  // init vol fill for swipe indicator
   document.getElementById('volFill').style.height=(v*100)+'%';
   document.getElementById('briFill').style.height='50%';
   document.getElementById('retryTog').classList.add('on');
   document.getElementById('wakeTog').classList.add('on');
   document.getElementById('proxyTog').classList.add('on');
+
+  // Restore proxy mode (default: manifest-only to save bandwidth)
+  const savedMode = localStorage.getItem('sx_pm') || 'manifest';
+  proxyMode = savedMode;
+  document.getElementById('modeManifest').classList.toggle('active', savedMode === 'manifest');
+  document.getElementById('modeFull').classList.toggle('active', savedMode === 'full');
+
   // Show worker count in proxy hint
   const hint = document.getElementById('proxyHint');
   if(hint) hint.textContent = `${PROXY_POOL.length} worker${PROXY_POOL.length>1?'s':''} · round-robin rotation`;
